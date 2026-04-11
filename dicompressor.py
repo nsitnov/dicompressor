@@ -82,6 +82,18 @@ def mark_as_done(folder: str, action: str, results: list):
     logger.info(f"Marked as done: {marker_path}")
 
 
+def copy_to_output_dir(result_files: list, output_dir: str):
+    """Copy result files to the specified output directory."""
+    import shutil
+    os.makedirs(output_dir, exist_ok=True)
+    for src in result_files:
+        if isinstance(src, str) and os.path.isfile(src):
+            dst = os.path.join(output_dir, os.path.basename(src))
+            shutil.copy2(src, dst)
+            size_mb = os.path.getsize(dst) / 1024 / 1024
+            logger.info(f"Copied to output: {dst} ({size_mb:.1f} MB)")
+
+
 def print_banner():
     """Print program banner."""
     print(f"""
@@ -168,6 +180,9 @@ SWITCHES (compatible with Sante Dicommander):
                   Creates the marker after successful processing.
   --watch N       Watch mode: re-scan subfolders every N seconds,
                   process only new (unmarked) ones. Ctrl+C to stop.
+  --output-dir D  Copy merged result files to directory D.
+                  Works with -j, --skip-if-done, and --watch.
+                  Directory is created automatically if it doesn't exist.
 
 EXAMPLES:
 ═════════
@@ -180,6 +195,9 @@ EXAMPLES:
 
   # Watch a folder with patient subfolders, auto-merge every 5 min:
   python dicompressor.py -j --watch 300 -f /path/to/patients/
+
+  # Watch + copy merged files to a central output folder:
+  python dicompressor.py -j --watch 300 --output-dir /data/merged -f /data/patients/
 
   # Compress all DICOM files with JPEG lossless:
   python dicompressor.py -x -f /path/to/folder
@@ -320,6 +338,10 @@ def main():
     parser.add_argument('--watch', dest='watch_interval', metavar='SECONDS', type=int,
                        help='Watch mode: re-scan folder every N seconds and process new subfolders. '
                             'Implies --skip-if-done. Press Ctrl+C to stop.')
+    parser.add_argument('--output-dir', dest='output_dir', metavar='DIR',
+                       help='Copy merged/processed result files to this directory. '
+                            'Works with -j (merge), --skip-if-done, and --watch. '
+                            'The directory is created automatically if it does not exist.')
 
     args = parser.parse_args()
 
@@ -482,6 +504,13 @@ def main():
         # ==========================================
         elif args.merge:
             if is_folder:
+                # Prepare output dir if specified
+                out_dir = None
+                if args.output_dir:
+                    out_dir = os.path.abspath(args.output_dir)
+                    os.makedirs(out_dir, exist_ok=True)
+                    print(f"Output directory: {out_dir}")
+
                 # --watch mode: loop and scan subfolders
                 if args.watch_interval:
                     args.skip_if_done = True  # --watch implies --skip-if-done
@@ -507,6 +536,8 @@ def main():
                                     for r in results:
                                         size_mb = os.path.getsize(r) / 1024 / 1024
                                         print(f"  -> {os.path.basename(r)} ({size_mb:.1f} MB)")
+                                    if out_dir:
+                                        copy_to_output_dir(results, out_dir)
                                     mark_as_done(subdir, "merge", results)
                                 except Exception as e:
                                     logger.error(f"  Failed: {e}")
@@ -530,6 +561,8 @@ def main():
                     for r in results:
                         size_mb = os.path.getsize(r) / 1024 / 1024
                         print(f"  -> {r} ({size_mb:.1f} MB)")
+                    if out_dir:
+                        copy_to_output_dir(results, out_dir)
                     if args.skip_if_done and results:
                         mark_as_done(target_path, "merge", results)
             else:

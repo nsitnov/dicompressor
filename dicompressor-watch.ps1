@@ -13,9 +13,13 @@
 .PARAMETER IntervalSeconds
     How often to scan (default: 300 = 5 minutes).
 
+.PARAMETER OutputDir
+    Optional: copy merged files to this directory.
+
 .EXAMPLE
     .\dicompressor-watch.ps1 -WatchDir "D:\DICOM\Patients"
     .\dicompressor-watch.ps1 -WatchDir "D:\DICOM\Patients" -IntervalSeconds 60
+    .\dicompressor-watch.ps1 -WatchDir "D:\DICOM\Patients" -OutputDir "D:\Merged" -IntervalSeconds 300
 
 .NOTES
     Folder structure:
@@ -33,7 +37,9 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$WatchDir,
 
-    [int]$IntervalSeconds = 300
+    [int]$IntervalSeconds = 300,
+
+    [string]$OutputDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -52,11 +58,20 @@ if (-not (Test-Path $Dicompressor -PathType Leaf)) {
     exit 1
 }
 
+if ($OutputDir -ne "") {
+    if (-not (Test-Path $OutputDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    }
+}
+
 Write-Host "===================================================" -ForegroundColor Cyan
 Write-Host " DicomPressor Watch Mode (PowerShell)" -ForegroundColor Cyan
-Write-Host " Watching: $WatchDir" -ForegroundColor Cyan
-Write-Host " Interval: ${IntervalSeconds}s" -ForegroundColor Cyan
-Write-Host " Marker:   $Marker" -ForegroundColor Cyan
+Write-Host " Watching:    $WatchDir" -ForegroundColor Cyan
+Write-Host " Interval:    ${IntervalSeconds}s" -ForegroundColor Cyan
+Write-Host " Marker:      $Marker" -ForegroundColor Cyan
+if ($OutputDir -ne "") {
+Write-Host " Output dir:  $OutputDir" -ForegroundColor Cyan
+}
 Write-Host " Press Ctrl+C to stop" -ForegroundColor Cyan
 Write-Host "===================================================" -ForegroundColor Cyan
 Write-Host ""
@@ -92,7 +107,12 @@ while ($true) {
         Write-Host "[$timestamp] NEW: $($dir.Name) ($($dcmFiles.Count) files)" -ForegroundColor Green
 
         try {
-            $output = & python $Dicompressor -j --skip-if-done -f $dir.FullName 2>&1
+            $cmdArgs = @("-j", "--skip-if-done")
+            if ($OutputDir -ne "") {
+                $cmdArgs += @("--output-dir", $OutputDir)
+            }
+            $cmdArgs += @("-f", $dir.FullName)
+            $output = & python $Dicompressor @cmdArgs 2>&1
             $output | ForEach-Object { Write-Host "  $_" }
             Write-Host "  Done!" -ForegroundColor Green
         }

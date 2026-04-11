@@ -8,7 +8,7 @@
 # and automatically merges their DICOM files into multi-frame.
 #
 # Usage:
-#   ./dicompressor-watch.sh /path/to/patients [interval_seconds]
+#   ./dicompressor-watch.sh /path/to/patients [interval_seconds] [output_dir]
 #
 # Example folder structure:
 #   /data/patients/
@@ -29,8 +29,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DICOMPRESSOR="$SCRIPT_DIR/dicompressor.py"
 MARKER=".dicompressor_done"
-WATCH_DIR="${1:?Usage: $0 /path/to/patients [interval_seconds]}"
+WATCH_DIR="${1:?Usage: $0 /path/to/patients [interval_seconds] [output_dir]}"
 INTERVAL="${2:-300}"  # default 5 minutes
+OUTPUT_DIR="${3:-}"   # optional: copy merged files here
 
 # Validate
 if [ ! -d "$WATCH_DIR" ]; then
@@ -43,11 +44,18 @@ if [ ! -f "$DICOMPRESSOR" ]; then
     exit 1
 fi
 
+if [ -n "$OUTPUT_DIR" ]; then
+    mkdir -p "$OUTPUT_DIR"
+fi
+
 echo "═══════════════════════════════════════════════════"
 echo " DicomPressor Watch Mode"
-echo " Watching: $WATCH_DIR"
-echo " Interval: ${INTERVAL}s"
-echo " Marker:   $MARKER"
+echo " Watching:    $WATCH_DIR"
+echo " Interval:    ${INTERVAL}s"
+echo " Marker:      $MARKER"
+if [ -n "$OUTPUT_DIR" ]; then
+echo " Output dir:  $OUTPUT_DIR"
+fi
 echo " Press Ctrl+C to stop"
 echo "═══════════════════════════════════════════════════"
 echo ""
@@ -81,7 +89,13 @@ while true; do
         echo "[$(date '+%H:%M:%S')] NEW: $FOLDER_NAME ($DCM_COUNT files)"
         echo "  Processing..."
 
-        if python3 "$DICOMPRESSOR" -j --skip-if-done -f "$dir"; then
+        CMD=(python3 "$DICOMPRESSOR" -j --skip-if-done)
+        if [ -n "$OUTPUT_DIR" ]; then
+            CMD+=(--output-dir "$OUTPUT_DIR")
+        fi
+        CMD+=(-f "$dir")
+
+        if "${CMD[@]}"; then
             echo "  Done!"
         else
             echo "  FAILED (see log above)"
