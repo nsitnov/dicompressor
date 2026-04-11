@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+test_results/
+test_results_v2/
+*.dcm

@@ -1,0 +1,2 @@
+(0008,1030)=DicomPressor Test Study
+(0008,103E)=Modified Series Description
