@@ -63,6 +63,8 @@ python dicompressor.py [action] [options] -f "C:\path\to\folder"
 | `-t` | Export headers to text files |
 | `--info` | Display DICOM file info |
 | `--summary` | Display folder summary |
+| `--skip-if-done` | Skip if .dicompressor_done marker exists; create after success |
+| `--watch N` | Watch mode: re-scan every N seconds, process new subfolders |
 
 Lowercase = save with suffix, Uppercase = overwrite original.
 
@@ -71,6 +73,12 @@ Lowercase = save with suffix, Uppercase = overwrite original.
 ```bash
 # Merge 400 single-frame CT files into one multi-frame DICOM:
 python3 dicompressor.py -j -f /path/to/patient_folder
+
+# Merge, but skip if already processed (safe for cron/scheduler):
+python3 dicompressor.py -j --skip-if-done -f /path/to/patient_folder
+
+# Watch a folder with patient subfolders, auto-merge every 5 minutes:
+python3 dicompressor.py -j --watch 300 -f /path/to/patients/
 
 # Compress with JPEG lossless (85% size reduction):
 python3 dicompressor.py -x -f /path/to/folder
@@ -87,6 +95,23 @@ python3 dicompressor.py -a params.txt -f /path/to/folder
 # Modify DICOM tags:
 python3 dicompressor.py -m modify_params.txt -f /path/to/folder
 ```
+
+## Watch Scripts
+
+For production use, standalone watch scripts are included:
+
+### Linux / macOS / WSL
+```bash
+./dicompressor-watch.sh /path/to/patients [interval_seconds]
+# Default interval: 300 seconds (5 minutes)
+```
+
+### Windows PowerShell
+```powershell
+.\dicompressor-watch.ps1 -WatchDir "D:\DICOM\Patients" -IntervalSeconds 300
+```
+
+Both scripts monitor a parent folder with patient subfolders, automatically merge new DICOM files, and skip already-processed folders using the `.dicompressor_done` marker file.
 
 ## Parameter File Formats
 

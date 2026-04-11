@@ -59,6 +59,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger("dicompressor")
 
+# Marker file for --skip-if-done / --watch
+DONE_MARKER = ".dicompressor_done"
+
+def is_already_done(folder: str) -> bool:
+    """Check if a folder has already been processed (marker file exists)."""
+    return os.path.isfile(os.path.join(folder, DONE_MARKER))
+
+def mark_as_done(folder: str, action: str, results: list):
+    """Create a marker file after successful processing."""
+    marker_path = os.path.join(folder, DONE_MARKER)
+    import json
+    from datetime import datetime
+    info = {
+        "processed_at": datetime.now().isoformat(),
+        "action": action,
+        "results": [os.path.basename(r) if isinstance(r, str) else str(r) for r in results],
+        "dicompressor_version": VERSION,
+    }
+    with open(marker_path, "w") as f:
+        json.dump(info, f, indent=2)
+    logger.info(f"Marked as done: {marker_path}")
+
 
 def print_banner():
     """Print program banner."""
@@ -141,11 +163,23 @@ SWITCHES (compatible with Sante Dicommander):
   --info        Display info about DICOM file(s) in folder
   --summary     Display folder summary
 
+  --- Scheduler / Watch ---
+  --skip-if-done  Skip if .dicompressor_done marker exists in folder.
+                  Creates the marker after successful processing.
+  --watch N       Watch mode: re-scan subfolders every N seconds,
+                  process only new (unmarked) ones. Ctrl+C to stop.
+
 EXAMPLES:
 ═════════
 
   # Merge 400 single-frame CT files into one multi-frame DICOM:
   python dicompressor.py -j -f /path/to/patient_folder
+
+  # Merge, but skip if already done (safe to run repeatedly):
+  python dicompressor.py -j --skip-if-done -f /path/to/patient_folder
+
+  # Watch a folder with patient subfolders, auto-merge every 5 min:
+  python dicompressor.py -j --watch 300 -f /path/to/patients/
 
   # Compress all DICOM files with JPEG lossless:
   python dicompressor.py -x -f /path/to/folder
@@ -277,6 +311,15 @@ def main():
                        help='Verbose output')
     parser.add_argument('--quiet', dest='quiet', action='store_true',
                        help='Suppress output')
+
+    # Scheduler/watch support
+    parser.add_argument('--skip-if-done', dest='skip_if_done', action='store_true',
+                       help='Skip processing if .dicompressor_done marker exists in the folder. '
+                            'Creates the marker after successful processing. '
+                            'Useful for scheduled/cron jobs that re-scan the same folders.')
+    parser.add_argument('--watch', dest='watch_interval', metavar='SECONDS', type=int,
+                       help='Watch mode: re-scan folder every N seconds and process new subfolders. '
+                            'Implies --skip-if-done. Press Ctrl+C to stop.')
 
     args = parser.parse_args()
 
@@ -439,11 +482,56 @@ def main():
         # ==========================================
         elif args.merge:
             if is_folder:
-                results = merge_to_multiframe(target_path, include_subfolders)
-                print(f"Created {len(results)} multi-frame file(s)")
-                for r in results:
-                    size_mb = os.path.getsize(r) / 1024 / 1024
-                    print(f"  -> {r} ({size_mb:.1f} MB)")
+                # --watch mode: loop and scan subfolders
+                if args.watch_interval:
+                    args.skip_if_done = True  # --watch implies --skip-if-done
+                    print(f"Watch mode: scanning every {args.watch_interval}s (Ctrl+C to stop)")
+                    try:
+                        while True:
+                            subdirs = [os.path.join(target_path, d) for d in sorted(os.listdir(target_path))
+                                       if os.path.isdir(os.path.join(target_path, d))]
+                            new_count = 0
+                            for subdir in subdirs:
+                                if is_already_done(subdir):
+                                    continue
+                                # Check if folder has DICOM files
+                                dcm_files = find_dicom_files(subdir, False)
+                                if not dcm_files:
+                                    continue
+                                new_count += 1
+                                folder_name = os.path.basename(subdir)
+                                print(f"\n[NEW] {folder_name} ({len(dcm_files)} files)")
+                                try:
+                                    results = merge_to_multiframe(subdir, False)
+                                    print(f"  Merged into {len(results)} multi-frame file(s)")
+                                    for r in results:
+                                        size_mb = os.path.getsize(r) / 1024 / 1024
+                                        print(f"  -> {os.path.basename(r)} ({size_mb:.1f} MB)")
+                                    mark_as_done(subdir, "merge", results)
+                                except Exception as e:
+                                    logger.error(f"  Failed: {e}")
+                            if new_count == 0:
+                                print(f"[{time.strftime('%H:%M:%S')}] No new folders. Waiting {args.watch_interval}s...", end='\r')
+                            time.sleep(args.watch_interval)
+                    except KeyboardInterrupt:
+                        print("\nWatch mode stopped.")
+                        return 0
+
+                # --skip-if-done: check marker
+                elif args.skip_if_done and is_already_done(target_path):
+                    print(f"SKIPPED (already processed): {target_path}")
+                    print(f"  Marker: {os.path.join(target_path, DONE_MARKER)}")
+                    print(f"  Delete the marker file to re-process.")
+                    return 0
+
+                else:
+                    results = merge_to_multiframe(target_path, include_subfolders)
+                    print(f"Created {len(results)} multi-frame file(s)")
+                    for r in results:
+                        size_mb = os.path.getsize(r) / 1024 / 1024
+                        print(f"  -> {r} ({size_mb:.1f} MB)")
+                    if args.skip_if_done and results:
+                        mark_as_done(target_path, "merge", results)
             else:
                 print("ERROR: -j (merge) requires a folder path")
                 return 1
