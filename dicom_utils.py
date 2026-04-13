@@ -968,21 +968,13 @@ def _write_basic_dicomdir(output_path: str, patients: Dict) -> None:
 # 8. MERGE SINGLE-FRAME TO MULTI-FRAME
 # ============================================================
 
-def merge_to_multiframe(folder: str, include_subfolders: bool = True,
-                        output_folder: Optional[str] = None) -> List[str]:
-    """
-    Merge many single-frame DICOM files to one multi-frame DICOM file.
-    Groups by SeriesInstanceUID - one multi-frame file per series.
-    """
+def merge_files_to_multiframe(dicom_files: List[str], output_folder: str,
+                              raise_on_error: bool = False) -> List[str]:
+    """Merge a pre-selected list of single-frame DICOM files into multi-frame files."""
     if np is None:
         raise ImportError("numpy is required for merge operation")
-
-    dicom_files = find_dicom_files(folder, include_subfolders)
     if not dicom_files:
-        raise ValueError(f"No DICOM files found in {folder}")
-
-    if output_folder is None:
-        output_folder = folder
+        raise ValueError("No DICOM files were provided for merge")
 
     # Group by series
     series_groups = group_by_series(dicom_files)
@@ -994,9 +986,28 @@ def merge_to_multiframe(folder: str, include_subfolders: bool = True,
             results.append(out)
             logger.info(f"Merged {len(files)} files into: {out}")
         except Exception as e:
+            if raise_on_error:
+                raise RuntimeError(f"Failed to merge series {series_uid}: {e}") from e
             logger.error(f"Failed to merge series {series_uid}: {e}")
 
     return results
+
+
+def merge_to_multiframe(folder: str, include_subfolders: bool = True,
+                        output_folder: Optional[str] = None,
+                        raise_on_error: bool = False) -> List[str]:
+    """
+    Merge many single-frame DICOM files to one multi-frame DICOM file.
+    Groups by SeriesInstanceUID - one multi-frame file per series.
+    """
+    dicom_files = find_dicom_files(folder, include_subfolders)
+    if not dicom_files:
+        raise ValueError(f"No DICOM files found in {folder}")
+
+    if output_folder is None:
+        output_folder = folder
+
+    return merge_files_to_multiframe(dicom_files, output_folder, raise_on_error=raise_on_error)
 
 
 def _merge_series_to_multiframe(files: List[str], series_uid: str,

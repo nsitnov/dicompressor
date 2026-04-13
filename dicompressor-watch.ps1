@@ -3,34 +3,9 @@
     DicomPressor Watch Script (Windows PowerShell)
 
 .DESCRIPTION
-    Watches a parent folder containing patient subfolders.
-    Every INTERVAL seconds, scans for new (unprocessed) subfolders
-    and automatically merges their DICOM files into multi-frame.
-
-.PARAMETER WatchDir
-    Path to the parent folder containing patient subfolders.
-
-.PARAMETER IntervalSeconds
-    How often to scan (default: 300 = 5 minutes).
-
-.PARAMETER OutputDir
-    Optional: copy merged files to this directory.
-
-.EXAMPLE
-    .\dicompressor-watch.ps1 -WatchDir "D:\DICOM\Patients"
-    .\dicompressor-watch.ps1 -WatchDir "D:\DICOM\Patients" -IntervalSeconds 60
-    .\dicompressor-watch.ps1 -WatchDir "D:\DICOM\Patients" -OutputDir "D:\Merged" -IntervalSeconds 300
-
-.NOTES
-    Folder structure:
-      D:\DICOM\Patients\
-        patient_001\        <- contains 400 single-frame .dcm files
-        patient_002\        <- new patient, will be auto-merged
-        patient_003\        <- already has .dicompressor_done, skipped
-
-    Creates .dicompressor_done marker in each folder after processing.
-    Delete the marker to re-process a folder.
-    Press Ctrl+C to stop.
+    Thin wrapper around the Python watch mode for the generic DicomPressor workflow.
+    Watches a parent folder for new mergeable DICOM study folders and writes logs to
+    the same rotating log file format as the core CLI.
 #>
 
 param(
@@ -39,98 +14,54 @@ param(
 
     [int]$IntervalSeconds = 300,
 
-    [string]$OutputDir = ""
+    [string]$OutputDir = "",
+
+    [string]$LogFile = ""
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Dicompressor = Join-Path $ScriptDir "dicompressor.py"
-$Marker = ".dicompressor_done"
+$Wrapper = Join-Path $ScriptDir "dicompressor.ps1"
 
-# Validate
 if (-not (Test-Path $WatchDir -PathType Container)) {
     Write-Error "Directory not found: $WatchDir"
     exit 1
 }
 
-if (-not (Test-Path $Dicompressor -PathType Leaf)) {
-    Write-Error "dicompressor.py not found at: $Dicompressor"
+if (-not (Test-Path $Wrapper -PathType Leaf)) {
+    Write-Error "dicompressor.ps1 not found at: $Wrapper"
     exit 1
 }
 
-if ($OutputDir -ne "") {
-    if (-not (Test-Path $OutputDir -PathType Container)) {
-        New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-    }
+if ($OutputDir -ne "" -and -not (Test-Path $OutputDir -PathType Container)) {
+    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+}
+
+if ($LogFile -eq "") {
+    $LogFile = Join-Path $ScriptDir "dicompressor.log"
+}
+
+$logDir = Split-Path -Parent $LogFile
+if ($logDir -and -not (Test-Path $logDir -PathType Container)) {
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 }
 
 Write-Host "===================================================" -ForegroundColor Cyan
-Write-Host " DicomPressor Watch Mode (PowerShell)" -ForegroundColor Cyan
+Write-Host " DicomPressor Watch Mode" -ForegroundColor Cyan
 Write-Host " Watching:    $WatchDir" -ForegroundColor Cyan
 Write-Host " Interval:    ${IntervalSeconds}s" -ForegroundColor Cyan
-Write-Host " Marker:      $Marker" -ForegroundColor Cyan
 if ($OutputDir -ne "") {
-Write-Host " Output dir:  $OutputDir" -ForegroundColor Cyan
+    Write-Host " Output dir:  $OutputDir" -ForegroundColor Cyan
 }
+Write-Host " Log file:    $LogFile" -ForegroundColor Cyan
 Write-Host " Press Ctrl+C to stop" -ForegroundColor Cyan
 Write-Host "===================================================" -ForegroundColor Cyan
 Write-Host ""
 
-# Main loop
-while ($true) {
-    $NewCount = 0
-    $DoneCount = 0
-    $EmptyCount = 0
-
-    $subdirs = Get-ChildItem -Path $WatchDir -Directory
-
-    foreach ($dir in $subdirs) {
-        $markerPath = Join-Path $dir.FullName $Marker
-
-        # Already processed?
-        if (Test-Path $markerPath) {
-            $DoneCount++
-            continue
-        }
-
-        # Has DICOM files?
-        $dcmFiles = Get-ChildItem -Path $dir.FullName -Filter "*.dcm" -File
-        if ($dcmFiles.Count -eq 0) {
-            $EmptyCount++
-            continue
-        }
-
-        # New folder -- process it
-        $NewCount++
-        $timestamp = Get-Date -Format "HH:mm:ss"
-        Write-Host ""
-        Write-Host "[$timestamp] NEW: $($dir.Name) ($($dcmFiles.Count) files)" -ForegroundColor Green
-
-        try {
-            $cmdArgs = @("-j", "--skip-if-done")
-            if ($OutputDir -ne "") {
-                $cmdArgs += @("--output-dir", $OutputDir)
-            }
-            $cmdArgs += @("-f", $dir.FullName)
-            $output = & python $Dicompressor @cmdArgs 2>&1
-            $output | ForEach-Object { Write-Host "  $_" }
-            Write-Host "  Done!" -ForegroundColor Green
-        }
-        catch {
-            Write-Host "  FAILED: $_" -ForegroundColor Red
-        }
-    }
-
-    $Total = $NewCount + $DoneCount + $EmptyCount
-    $timestamp = Get-Date -Format "HH:mm:ss"
-
-    if ($NewCount -eq 0) {
-        Write-Host "`r[$timestamp] $Total folders ($DoneCount done, $EmptyCount empty). Next scan in ${IntervalSeconds}s..." -NoNewline
-    }
-    else {
-        Write-Host ""
-        Write-Host "[$timestamp] Processed $NewCount new folder(s). Total: $Total ($DoneCount done)" -ForegroundColor Yellow
-    }
-
-    Start-Sleep -Seconds $IntervalSeconds
+$cmdArgs = @("-j", "--watch", $IntervalSeconds, "--log-file", $LogFile, "-f", $WatchDir)
+if ($OutputDir -ne "") {
+    $cmdArgs += @("--output-dir", $OutputDir)
 }
+
+& $Wrapper @cmdArgs
+exit $LASTEXITCODE

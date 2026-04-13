@@ -10,11 +10,20 @@ Actions match Sante Dicommander switches where applicable.
 """
 
 import argparse
+import json
+import logging
 import os
 import sys
 import time
-import logging
-from pathlib import Path
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+
+try:
+    import pydicom
+except ImportError:
+    print("ERROR: pydicom is required. Install with: pip install pydicom")
+    sys.exit(1)
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,7 +41,7 @@ from dicom_utils import (
     # DICOMDIR
     create_dicomdir,
     # Merge/Split
-    merge_to_multiframe, split_multiframe, split_multiframe_folder,
+    merge_files_to_multiframe, merge_to_multiframe, split_multiframe, split_multiframe_folder,
     # NEMA2 conversion
     convert_nema2_folder, nema2_to_dicom3, dicom3_to_nema2,
     # Endian
@@ -48,69 +57,148 @@ from dicom_utils import (
     find_dicom_files, is_dicom_file,
 )
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 PROGRAM_NAME = "DicomPressor"
+DONE_MARKER = ".dicompressor_done"
+DEFAULT_LOG_FILENAME = "dicompressor.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+SCAN_PROGRESS_EVERY_FOLDERS = 250
+SCAN_PROGRESS_EVERY_SECONDS = 15.0
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S'
-)
 logger = logging.getLogger("dicompressor")
 
-# Marker file for --skip-if-done / --watch
-DONE_MARKER = ".dicompressor_done"
+
+def default_log_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), DEFAULT_LOG_FILENAME)
+
+
+def supports_unicode_output(stream=None) -> bool:
+    stream = stream or sys.stdout
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        "╔═║╝".encode(encoding)
+        return True
+    except (LookupError, UnicodeEncodeError):
+        return False
+
+
+def configure_logging(verbose: bool, quiet: bool, log_file: str = "") -> str:
+    console_level = logging.INFO
+    if verbose:
+        console_level = logging.DEBUG
+    elif quiet:
+        console_level = logging.WARNING
+
+    effective_log_file = os.path.abspath(log_file) if log_file else default_log_path()
+    log_dir = os.path.dirname(effective_log_file)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+    root_logger.setLevel(logging.DEBUG)
+
+    console_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(console_level)
+    console_handler.setFormatter(console_formatter)
+    root_logger.addHandler(console_handler)
+
+    file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    file_handler = RotatingFileHandler(
+        effective_log_file,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(file_formatter)
+    root_logger.addHandler(file_handler)
+
+    logging.captureWarnings(True)
+    logger.debug(
+        "Logging configured: console=%s file=%s",
+        logging.getLevelName(console_level),
+        effective_log_file,
+    )
+    return effective_log_file
+
+
+def marker_path(folder: str) -> str:
+    return os.path.join(folder, DONE_MARKER)
 
 def is_already_done(folder: str) -> bool:
     """Check if a folder has already been processed (marker file exists)."""
-    return os.path.isfile(os.path.join(folder, DONE_MARKER))
+    return os.path.isfile(marker_path(folder))
 
 def mark_as_done(folder: str, action: str, results: list):
     """Create a marker file after successful processing."""
-    marker_path = os.path.join(folder, DONE_MARKER)
-    import json
-    from datetime import datetime
     info = {
         "processed_at": datetime.now().isoformat(),
         "action": action,
         "results": [os.path.basename(r) if isinstance(r, str) else str(r) for r in results],
         "dicompressor_version": VERSION,
     }
-    with open(marker_path, "w") as f:
-        json.dump(info, f, indent=2)
-    logger.info(f"Marked as done: {marker_path}")
+    with open(marker_path(folder), "w", encoding="utf-8") as handle:
+        json.dump(info, handle, indent=2)
+    logger.info("Marked as done: %s", marker_path(folder))
 
 
 def copy_to_output_dir(result_files: list, output_dir: str):
     """Copy result files to the specified output directory."""
     import shutil
+
     os.makedirs(output_dir, exist_ok=True)
     for src in result_files:
         if isinstance(src, str) and os.path.isfile(src):
             dst = os.path.join(output_dir, os.path.basename(src))
+            if os.path.abspath(src) == os.path.abspath(dst):
+                continue
+            if os.path.exists(dst):
+                stem, ext = os.path.splitext(os.path.basename(src))
+                counter = 1
+                while True:
+                    candidate = os.path.join(output_dir, f"{stem}_{counter}{ext}")
+                    if not os.path.exists(candidate):
+                        dst = candidate
+                        break
+                    counter += 1
             shutil.copy2(src, dst)
             size_mb = os.path.getsize(dst) / 1024 / 1024
-            logger.info(f"Copied to output: {dst} ({size_mb:.1f} MB)")
+            logger.info("Copied to output: %s (%.1f MB)", dst, size_mb)
 
 
 def print_banner():
     """Print program banner."""
-    print(f"""
+    if supports_unicode_output():
+        print(f"""
 ╔══════════════════════════════════════════════════════╗
-║  {PROGRAM_NAME} v{VERSION}                              ║
+║  {PROGRAM_NAME} v{VERSION:<31}║
 ║  Cross-platform DICOM CLI Tool                       ║
 ║  Compatible with: macOS, Windows, WSL/Linux          ║
 ╚══════════════════════════════════════════════════════╝
+""")
+        return
+
+    print(f"""
++------------------------------------------------------+
+|  {PROGRAM_NAME} v{VERSION:<31}|
+|  Cross-platform DICOM CLI Tool                       |
+|  Compatible with: macOS, Windows, WSL/Linux          |
++------------------------------------------------------+
 """)
 
 
 def print_help_detailed():
     """Print detailed help matching Sante Dicommander switch reference."""
     print_banner()
-    print("""
+    rule = "===============================================" if not supports_unicode_output() else "═══════════════════════════════════════════════"
+    rule_short = "=========" if not supports_unicode_output() else "═════════"
+    print(f"""
 SWITCHES (compatible with Sante Dicommander):
-═══════════════════════════════════════════════
+{rule}
 
   -h            Display this help text
   -c            Display version and copyright information
@@ -178,14 +266,17 @@ SWITCHES (compatible with Sante Dicommander):
   --- Scheduler / Watch ---
   --skip-if-done  Skip if .dicompressor_done marker exists in folder.
                   Creates the marker after successful processing.
-  --watch N       Watch mode: re-scan subfolders every N seconds,
-                  process only new (unmarked) ones. Ctrl+C to stop.
+  --watch N       Watch mode: re-scan recursively every N seconds,
+                  process mergeable folders as soon as they are found.
+                  Implies --skip-if-done. Ctrl+C to stop.
   --output-dir D  Copy merged result files to directory D.
                   Works with -j, --skip-if-done, and --watch.
                   Directory is created automatically if it doesn't exist.
+  --log-file FILE Write a rotating log file. Default:
+                  {default_log_path()}
 
 EXAMPLES:
-═════════
+{rule_short}
 
   # Merge 400 single-frame CT files into one multi-frame DICOM:
   python dicompressor.py -j -f /path/to/patient_folder
@@ -198,6 +289,12 @@ EXAMPLES:
 
   # Watch + copy merged files to a central output folder:
   python dicompressor.py -j --watch 300 --output-dir /data/merged -f /data/patients/
+
+  # Windows watch example:
+  python dicompressor.py -j --watch 300 --output-dir "D:\\Merged" -f "D:\\DICOM\\Patients"
+
+  # Custom log file:
+  python dicompressor.py -j --watch 300 --log-file /data/logs/dicompressor.log -f /data/patients
 
   # Compress all DICOM files with JPEG lossless:
   python dicompressor.py -x -f /path/to/folder
@@ -214,6 +311,258 @@ EXAMPLES:
   # Get folder summary:
   python dicompressor.py --summary -f /path/to/folder
 """)
+
+
+def parse_num_frames(dataset) -> int:
+    num_frames = getattr(dataset, "NumberOfFrames", 1)
+    if isinstance(num_frames, str):
+        try:
+            num_frames = int(num_frames)
+        except ValueError:
+            num_frames = 1
+    return int(num_frames)
+
+
+def find_mergeable_dicom_files(folder: str) -> List[str]:
+    results: List[str] = []
+    for name in sorted(os.listdir(folder)):
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path):
+            continue
+        if not is_dicom_file(path):
+            continue
+        try:
+            dataset = pydicom.dcmread(path, stop_before_pixels=True)
+        except Exception:
+            continue
+        if parse_num_frames(dataset) <= 1:
+            results.append(path)
+    return results
+
+
+def iter_scan_roots(root: str, recursive: bool, prune_done: bool = False) -> Iterator[Tuple[int, str]]:
+    root = os.path.abspath(root)
+
+    if not recursive:
+        yield 1, root
+        return
+
+    logger.info("Starting recursive scan under %s", root)
+    scanned_count = 0
+    scan_started = time.time()
+    last_progress_time = scan_started
+
+    for current_root, dirnames, _ in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        if prune_done and is_already_done(current_root):
+            logger.debug("Pruning already processed subtree: %s", current_root)
+            dirnames[:] = []
+
+        scanned_count += 1
+        yield scanned_count, current_root
+
+        now = time.time()
+        if (
+            scanned_count % SCAN_PROGRESS_EVERY_FOLDERS == 0
+            or now - last_progress_time >= SCAN_PROGRESS_EVERY_SECONDS
+        ):
+            logger.info(
+                "Scan progress: scanned %d folder(s). Current=%s",
+                scanned_count,
+                current_root,
+            )
+            last_progress_time = now
+
+    logger.info(
+        "Finished recursive scan under %s: scanned %d folder(s) in %.1fs",
+        root,
+        scanned_count,
+        time.time() - scan_started,
+    )
+
+
+def process_merge_folder(
+    folder: str,
+    output_dir: str = "",
+    dicom_files: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
+    folder = os.path.abspath(folder)
+    if dicom_files is None:
+        dicom_files = find_mergeable_dicom_files(folder)
+    else:
+        dicom_files = list(dicom_files)
+
+    if not dicom_files:
+        raise ValueError(f"No mergeable single-frame DICOM files found in {folder}")
+
+    logger.info("Processing folder: %s (single-frame inputs=%d)", folder, len(dicom_files))
+    results = merge_files_to_multiframe(list(dicom_files), folder, raise_on_error=True)
+    if not results:
+        raise ValueError(f"No multi-frame output was created for {folder}")
+
+    if output_dir:
+        copy_to_output_dir(results, output_dir)
+
+    return {
+        "folder": folder,
+        "results": results,
+        "direct_dicom_count": len(dicom_files),
+    }
+
+
+def print_folder_report(report: Dict[str, object], target_root: str) -> None:
+    folder = os.path.abspath(str(report["folder"]))
+    root = os.path.abspath(target_root)
+    try:
+        display_folder = os.path.relpath(folder, root)
+    except ValueError:
+        display_folder = folder
+    if display_folder == ".":
+        display_folder = os.path.basename(folder) or folder
+
+    print(f"\n[OK] {display_folder}")
+    print(f"  Single-frame inputs: {report['direct_dicom_count']}")
+    for result in report["results"]:
+        size_mb = os.path.getsize(result) / 1024 / 1024
+        print(f"  -> {os.path.basename(result)} ({size_mb:.1f} MB)")
+
+
+def print_failed_folder(folder: str, exc: Exception) -> None:
+    print(f"\n[FAILED] {folder}")
+    print(f"  {exc}")
+
+
+def run_merge_once(
+    target_path: str,
+    include_subfolders: bool,
+    skip_if_done: bool,
+    output_dir: str = "",
+) -> int:
+    if skip_if_done and is_already_done(target_path):
+        print(f"SKIPPED (already processed): {target_path}")
+        print(f"  Marker: {marker_path(target_path)}")
+        print("  Delete the marker file to re-process.")
+        logger.info("Skipping already processed folder: %s", target_path)
+        return 0
+
+    results = merge_to_multiframe(
+        target_path,
+        include_subfolders,
+        raise_on_error=skip_if_done,
+    )
+    print(f"Created {len(results)} multi-frame file(s)")
+    for result in results:
+        size_mb = os.path.getsize(result) / 1024 / 1024
+        print(f"  -> {result} ({size_mb:.1f} MB)")
+    if output_dir:
+        copy_to_output_dir(results, output_dir)
+    if skip_if_done and results:
+        mark_as_done(target_path, "merge", results)
+    logger.info(
+        "Merge summary for %s: output_files=%d include_subfolders=%s",
+        target_path,
+        len(results),
+        include_subfolders,
+    )
+    return 0
+
+
+def run_merge_watch(target_path: str, recursive: bool, interval: int, output_dir: str = "") -> int:
+    print(f"Watch mode: scanning every {interval}s (Ctrl+C to stop)", flush=True)
+    pass_number = 0
+    try:
+        while True:
+            pass_number += 1
+            pass_started = time.time()
+            logger.info("Starting watch scan pass #%d under %s", pass_number, target_path)
+            new_count = 0
+            skipped_done = 0
+            failed_count = 0
+            discovered_count = 0
+
+            for scanned_count, folder in iter_scan_roots(target_path, recursive, prune_done=True):
+                if is_already_done(folder):
+                    skipped_done += 1
+                    logger.debug("Skipping already processed folder: %s", folder)
+                    continue
+
+                dicom_files = find_mergeable_dicom_files(folder)
+                if not dicom_files:
+                    continue
+
+                discovered_count += 1
+                logger.info(
+                    "Found processable folder #%d after scanning %d folder(s): %s "
+                    "(single-frame inputs=%d)",
+                    discovered_count,
+                    scanned_count,
+                    folder,
+                    len(dicom_files),
+                )
+
+                try:
+                    report = process_merge_folder(
+                        folder,
+                        output_dir=output_dir,
+                        dicom_files=dicom_files,
+                    )
+                    print_folder_report(report, target_path)
+                    mark_as_done(folder, "merge", report["results"])
+                    new_count += 1
+                except Exception as exc:
+                    failed_count += 1
+                    logger.error("Failed to process %s: %s", folder, exc)
+                    print_failed_folder(folder, exc)
+
+            pass_elapsed = time.time() - pass_started
+            logger.info(
+                "Completed watch scan pass #%d: discovered=%d new=%d skipped_done=%d "
+                "failed=%d elapsed=%.1fs",
+                pass_number,
+                discovered_count,
+                new_count,
+                skipped_done,
+                failed_count,
+                pass_elapsed,
+            )
+
+            sleep_seconds = max(0.0, interval - pass_elapsed)
+            if new_count == 0 and failed_count == 0:
+                if sleep_seconds > 0:
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] No new folders. "
+                        f"Waiting {int(round(sleep_seconds))}s...",
+                    )
+                else:
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] No new folders. "
+                        "Starting the next scan immediately.",
+                    )
+            else:
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] Pass #{pass_number}: processed {new_count} "
+                    f"new folder(s), skipped {skipped_done}, failed {failed_count}."
+                )
+
+            if sleep_seconds > 0:
+                logger.info(
+                    "Waiting %.1fs before watch scan pass #%d",
+                    sleep_seconds,
+                    pass_number + 1,
+                )
+                time.sleep(sleep_seconds)
+            else:
+                logger.info(
+                    "Scan pass #%d took %.1fs which exceeded interval %ss; "
+                    "starting the next pass immediately",
+                    pass_number,
+                    pass_elapsed,
+                    interval,
+                )
+    except KeyboardInterrupt:
+        print("\nWatch mode stopped.")
+        logger.info("Watch mode stopped by user")
+        return 0
 
 
 def main():
@@ -342,14 +691,10 @@ def main():
                        help='Copy merged/processed result files to this directory. '
                             'Works with -j (merge), --skip-if-done, and --watch. '
                             'The directory is created automatically if it does not exist.')
+    parser.add_argument('--log-file', dest='log_file', metavar='FILE',
+                       help=f'Write logs to FILE (default: {default_log_path()})')
 
     args = parser.parse_args()
-
-    # Setup logging level
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    elif args.quiet:
-        logging.getLogger().setLevel(logging.WARNING)
 
     # Help
     if args.show_help or len(sys.argv) == 1:
@@ -382,7 +727,13 @@ def main():
     is_file = os.path.isfile(target_path)
     is_folder = os.path.isdir(target_path)
 
+    log_file = configure_logging(args.verbose, args.quiet, args.log_file or "")
+    print(f"Log file: {log_file}", flush=True)
+    logger.info("Starting %s v%s", PROGRAM_NAME, VERSION)
+    logger.info("Log file: %s", log_file)
+
     start_time = time.time()
+    exit_code = 0
 
     try:
         # ==========================================
@@ -504,67 +855,27 @@ def main():
         # ==========================================
         elif args.merge:
             if is_folder:
-                # Prepare output dir if specified
-                out_dir = None
+                out_dir = ""
                 if args.output_dir:
                     out_dir = os.path.abspath(args.output_dir)
                     os.makedirs(out_dir, exist_ok=True)
                     print(f"Output directory: {out_dir}")
 
-                # --watch mode: loop and scan subfolders
                 if args.watch_interval:
-                    args.skip_if_done = True  # --watch implies --skip-if-done
-                    print(f"Watch mode: scanning every {args.watch_interval}s (Ctrl+C to stop)")
-                    try:
-                        while True:
-                            subdirs = [os.path.join(target_path, d) for d in sorted(os.listdir(target_path))
-                                       if os.path.isdir(os.path.join(target_path, d))]
-                            new_count = 0
-                            for subdir in subdirs:
-                                if is_already_done(subdir):
-                                    continue
-                                # Check if folder has DICOM files
-                                dcm_files = find_dicom_files(subdir, False)
-                                if not dcm_files:
-                                    continue
-                                new_count += 1
-                                folder_name = os.path.basename(subdir)
-                                print(f"\n[NEW] {folder_name} ({len(dcm_files)} files)")
-                                try:
-                                    results = merge_to_multiframe(subdir, False)
-                                    print(f"  Merged into {len(results)} multi-frame file(s)")
-                                    for r in results:
-                                        size_mb = os.path.getsize(r) / 1024 / 1024
-                                        print(f"  -> {os.path.basename(r)} ({size_mb:.1f} MB)")
-                                    if out_dir:
-                                        copy_to_output_dir(results, out_dir)
-                                    mark_as_done(subdir, "merge", results)
-                                except Exception as e:
-                                    logger.error(f"  Failed: {e}")
-                            if new_count == 0:
-                                print(f"[{time.strftime('%H:%M:%S')}] No new folders. Waiting {args.watch_interval}s...", end='\r')
-                            time.sleep(args.watch_interval)
-                    except KeyboardInterrupt:
-                        print("\nWatch mode stopped.")
-                        return 0
-
-                # --skip-if-done: check marker
-                elif args.skip_if_done and is_already_done(target_path):
-                    print(f"SKIPPED (already processed): {target_path}")
-                    print(f"  Marker: {os.path.join(target_path, DONE_MARKER)}")
-                    print(f"  Delete the marker file to re-process.")
-                    return 0
-
+                    args.skip_if_done = True
+                    exit_code = run_merge_watch(
+                        target_path=target_path,
+                        recursive=include_subfolders,
+                        interval=args.watch_interval,
+                        output_dir=out_dir,
+                    )
                 else:
-                    results = merge_to_multiframe(target_path, include_subfolders)
-                    print(f"Created {len(results)} multi-frame file(s)")
-                    for r in results:
-                        size_mb = os.path.getsize(r) / 1024 / 1024
-                        print(f"  -> {r} ({size_mb:.1f} MB)")
-                    if out_dir:
-                        copy_to_output_dir(results, out_dir)
-                    if args.skip_if_done and results:
-                        mark_as_done(target_path, "merge", results)
+                    exit_code = run_merge_once(
+                        target_path=target_path,
+                        include_subfolders=include_subfolders,
+                        skip_if_done=args.skip_if_done,
+                        output_dir=out_dir,
+                    )
             else:
                 print("ERROR: -j (merge) requires a folder path")
                 return 1
@@ -716,7 +1027,8 @@ def main():
 
     elapsed = time.time() - start_time
     print(f"\nCompleted in {elapsed:.2f} seconds")
-    return 0
+    logger.info("Completed in %.2f seconds with exit code %d", elapsed, exit_code)
+    return exit_code
 
 
 if __name__ == '__main__':
