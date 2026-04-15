@@ -136,6 +136,7 @@ The direct `python .\dicompressor.py ...` command is still the safest Windows op
 | `--watch N` | Re-scan every `N` seconds and process only new folders |
 | `--output-dir DIR` | Copy merged outputs to `DIR` |
 | `--log-file FILE` | Write a rotating log file to `FILE` |
+| `--scan-state-file FILE` | Persistent per-folder mtime cache used by `--watch` to skip folders whose contents haven't changed. Pass an empty string to disable. |
 | `--verbose` | Debug logging |
 | `--quiet` | Warnings/errors only |
 
@@ -186,10 +187,12 @@ python3 dicompressor.py -a params.txt -f /path/to/folder
 ### Windows PowerShell
 
 ```powershell
-.\dicompressor-watch.ps1 -WatchDir "D:\DICOM\Patients" -IntervalSeconds 300 -OutputDir "D:\Merged" -LogFile "D:\DICOM\Logs\dicompressor.log"
+.\dicompressor-watch.ps1 -WatchDir "D:\DICOM\Patients" -IntervalSeconds 300 -OutputDir "D:\Merged" -LogFile "D:\DICOM\Logs\dicompressor.log" -ScanStateFile "D:\DICOM\Logs\dicompressor.scan-state.json"
 ```
 
-Both watch scripts are now thin wrappers around the Python watch mode. They use the same marker logic, the same rotating log file support, and the same streaming scan behavior as the main CLI.
+Both watch scripts are thin wrappers around the Python watch mode. They use the same marker logic, the same rotating log file support, the same streaming scan behavior, and the same incremental `--scan-state-file` cache as the main CLI.
+
+If you pass a custom log path but omit a scan-state path, the watch wrappers automatically place the cache next to the log as `<log-stem>.scan-state.json`. If you want the built-in default instead, call `python .\dicompressor.py ...` directly and omit `--scan-state-file`.
 
 ## Watch Behavior
 

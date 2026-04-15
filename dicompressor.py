@@ -58,10 +58,12 @@ from dicom_utils import (
     find_dicom_files, is_dicom_file,
 )
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 PROGRAM_NAME = "DicomPressor"
 DONE_MARKER = ".dicompressor_done"
 DEFAULT_LOG_FILENAME = "dicompressor.log"
+DEFAULT_SCAN_STATE_FILENAME = "dicompressor-scan-state.json"
+SCAN_STATE_VERSION = 1
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 SCAN_PROGRESS_EVERY_FOLDERS = 250
@@ -89,6 +91,10 @@ print = console_print
 
 def default_log_path() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), DEFAULT_LOG_FILENAME)
+
+
+def default_scan_state_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), DEFAULT_SCAN_STATE_FILENAME)
 
 
 def supports_unicode_output(stream=None) -> bool:
@@ -162,6 +168,144 @@ def mark_as_done(folder: str, action: str, results: list):
     with open(marker_path(folder), "w", encoding="utf-8") as handle:
         json.dump(info, handle, indent=2)
     logger.info("Marked as done: %s", marker_path(folder))
+
+
+# ---------------------------------------------------------------------------
+# Persistent per-folder scan state.
+#
+# Caches os.stat(folder).st_mtime_ns so subsequent watch passes can skip
+# folders whose direct-child list hasn't changed since they were last
+# scanned. This avoids re-opening thousands of DICOM headers every cycle on
+# large trees that only change near the edges.
+# ---------------------------------------------------------------------------
+
+
+def empty_scan_state(root: str = "") -> Dict[str, object]:
+    return {
+        "version": SCAN_STATE_VERSION,
+        "root": os.path.abspath(root) if root else "",
+        "folders": {},
+    }
+
+
+def load_scan_state(path: str, root: str) -> Dict[str, object]:
+    if not path:
+        return empty_scan_state(root)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        logger.info("Scan state file not found, starting fresh: %s", path)
+        return empty_scan_state(root)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "Scan state file %s is unreadable (%s); starting fresh",
+            path,
+            exc,
+        )
+        return empty_scan_state(root)
+
+    if not isinstance(data, dict) or data.get("version") != SCAN_STATE_VERSION:
+        logger.warning(
+            "Scan state file %s has unexpected format; starting fresh",
+            path,
+        )
+        return empty_scan_state(root)
+
+    folders = data.get("folders")
+    if not isinstance(folders, dict):
+        folders = {}
+    data["folders"] = folders
+
+    cached_root = data.get("root") or ""
+    if root and cached_root and os.path.abspath(cached_root) != os.path.abspath(root):
+        logger.warning(
+            "Scan state file %s is for root %s but current root is %s; starting fresh",
+            path,
+            cached_root,
+            root,
+        )
+        return empty_scan_state(root)
+    data["root"] = os.path.abspath(root) if root else cached_root
+
+    logger.info(
+        "Loaded scan state from %s: %d folder entries",
+        path,
+        len(folders),
+    )
+    return data
+
+
+def save_scan_state(path: str, state: Dict[str, object]) -> None:
+    if not path:
+        return
+    try:
+        directory = os.path.dirname(os.path.abspath(path))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        logger.warning("Failed to save scan state to %s: %s", path, exc)
+
+
+def get_folder_state(state: Optional[Dict[str, object]], folder: str) -> Optional[Dict[str, object]]:
+    if not state:
+        return None
+    folders = state.get("folders")
+    if not isinstance(folders, dict):
+        return None
+    entry = folders.get(os.path.abspath(folder))
+    if isinstance(entry, dict):
+        return entry
+    return None
+
+
+def update_folder_state(
+    state: Optional[Dict[str, object]],
+    folder: str,
+    mtime_ns: Optional[int],
+    *,
+    empty: Optional[bool] = None,
+    done: Optional[bool] = None,
+) -> None:
+    if not state:
+        return
+    folders = state.setdefault("folders", {})
+    key = os.path.abspath(folder)
+    entry = folders.get(key)
+    if not isinstance(entry, dict):
+        entry = {}
+    if mtime_ns is not None:
+        entry["mtime_ns"] = mtime_ns
+    if empty is not None:
+        entry["empty"] = bool(empty)
+    if done is not None:
+        entry["done"] = bool(done)
+    folders[key] = entry
+
+
+def folder_cache_is_fresh(
+    state: Optional[Dict[str, object]],
+    folder: str,
+    current_mtime_ns: Optional[int],
+) -> Tuple[bool, Optional[Dict[str, object]]]:
+    entry = get_folder_state(state, folder)
+    if entry is None or current_mtime_ns is None:
+        return False, entry
+    cached_mtime = entry.get("mtime_ns")
+    if not isinstance(cached_mtime, int):
+        return False, entry
+    return cached_mtime == current_mtime_ns, entry
+
+
+def _safe_dir_mtime_ns(path: str) -> Optional[int]:
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
 
 
 def copy_to_output_dir(result_files: list, output_dir: str):
@@ -292,6 +436,10 @@ SWITCHES (compatible with Sante Dicommander):
                   Directory is created automatically if it doesn't exist.
   --log-file FILE Write a rotating log file. Default:
                   {default_log_path()}
+  --scan-state-file FILE
+                  Persistent per-folder mtime cache used by --watch.
+                  Default: {default_scan_state_path()}
+                  Pass an empty string to disable the cache.
 
 EXAMPLES:
 {rule_short}
@@ -313,6 +461,10 @@ EXAMPLES:
 
   # Custom log file:
   python dicompressor.py -j --watch 300 --log-file /data/logs/dicompressor.log -f /data/patients
+
+  # Custom scan-state file:
+  python dicompressor.py -j --watch 300 --log-file /data/logs/dicompressor.log \
+    --scan-state-file /data/logs/dicompressor.scan-state.json -f /data/patients
 
   # Compress all DICOM files with JPEG lossless:
   python dicompressor.py -x -f /path/to/folder
@@ -341,12 +493,39 @@ def parse_num_frames(dataset) -> int:
     return int(num_frames)
 
 
-def find_mergeable_dicom_files(folder: str) -> List[str]:
+def _list_folder_files(folder: str) -> List[str]:
+    """Return sorted basenames of regular files directly in ``folder`` using os.scandir."""
+    names: List[str] = []
+    try:
+        with os.scandir(folder) as it:
+            for entry in it:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        names.append(entry.name)
+                except OSError:
+                    continue
+    except OSError as exc:
+        logger.warning("Cannot list folder %s: %s", folder, exc)
+        return []
+    names.sort()
+    return names
+
+
+def find_mergeable_dicom_files(
+    folder: str,
+    scan_state: Optional[Dict[str, object]] = None,
+    folder_mtime_ns: Optional[int] = None,
+) -> List[str]:
+    # Skip the expensive pydicom parse when mtime matches the cached value
+    # and last time we recorded this folder as empty. Saves one dcmread per
+    # file per pass on large unchanged trees.
+    is_fresh, entry = folder_cache_is_fresh(scan_state, folder, folder_mtime_ns)
+    if is_fresh and entry is not None and entry.get("empty"):
+        return []
+
     results: List[str] = []
-    for name in sorted(os.listdir(folder)):
+    for name in _list_folder_files(folder):
         path = os.path.join(folder, name)
-        if not os.path.isfile(path):
-            continue
         if not is_dicom_file(path):
             continue
         try:
@@ -358,11 +537,20 @@ def find_mergeable_dicom_files(folder: str) -> List[str]:
     return results
 
 
-def iter_scan_roots(root: str, recursive: bool, prune_done: bool = False) -> Iterator[Tuple[int, str]]:
+def iter_scan_roots(
+    root: str,
+    recursive: bool,
+    prune_done: bool = False,
+) -> Iterator[Tuple[int, str, Optional[int]]]:
+    """Yield (scanned_count, folder_path, folder_mtime_ns).
+
+    Uses an explicit os.scandir-based DFS rather than os.walk, which cuts
+    the per-directory syscall count roughly in half.
+    """
     root = os.path.abspath(root)
 
     if not recursive:
-        yield 1, root
+        yield 1, root, _safe_dir_mtime_ns(root)
         return
 
     logger.info("Starting recursive scan under %s", root)
@@ -370,14 +558,13 @@ def iter_scan_roots(root: str, recursive: bool, prune_done: bool = False) -> Ite
     scan_started = time.time()
     last_progress_time = scan_started
 
-    for current_root, dirnames, _ in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
-        if prune_done and is_already_done(current_root):
-            logger.debug("Pruning already processed subtree: %s", current_root)
-            dirnames[:] = []
+    stack: List[Tuple[str, Optional[int]]] = [(root, _safe_dir_mtime_ns(root))]
+
+    while stack:
+        current_root, current_mtime_ns = stack.pop()
 
         scanned_count += 1
-        yield scanned_count, current_root
+        yield scanned_count, current_root, current_mtime_ns
 
         now = time.time()
         if (
@@ -390,6 +577,34 @@ def iter_scan_roots(root: str, recursive: bool, prune_done: bool = False) -> Ite
                 current_root,
             )
             last_progress_time = now
+
+        if prune_done and is_already_done(current_root):
+            logger.debug("Pruning already processed subtree: %s", current_root)
+            continue
+
+        children: List[Tuple[str, Optional[int]]] = []
+        try:
+            with os.scandir(current_root) as it:
+                for entry in it:
+                    if entry.name.startswith("."):
+                        continue
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    try:
+                        child_mtime = entry.stat(follow_symlinks=False).st_mtime_ns
+                    except OSError:
+                        child_mtime = None
+                    children.append((entry.path, child_mtime))
+        except OSError as exc:
+            logger.warning("Cannot scan %s: %s", current_root, exc)
+            continue
+
+        children.sort(key=lambda item: item[0])
+        for child in reversed(children):
+            stack.append(child)
 
     logger.info(
         "Finished recursive scan under %s: scanned %d folder(s) in %.1fs",
@@ -485,8 +700,25 @@ def run_merge_once(
     return 0
 
 
-def run_merge_watch(target_path: str, recursive: bool, interval: int, output_dir: str = "") -> int:
+def run_merge_watch(
+    target_path: str,
+    recursive: bool,
+    interval: int,
+    output_dir: str = "",
+    scan_state: Optional[Dict[str, object]] = None,
+    scan_state_path: str = "",
+) -> int:
     print(f"Watch mode: scanning every {interval}s (Ctrl+C to stop)", flush=True)
+    if scan_state is not None:
+        folders = scan_state.get("folders") or {}
+        cached_done = sum(1 for e in folders.values() if isinstance(e, dict) and e.get("done"))
+        cached_empty = sum(1 for e in folders.values() if isinstance(e, dict) and e.get("empty"))
+        logger.info(
+            "Scan state loaded: %d folders cached (%d done, %d empty)",
+            len(folders),
+            cached_done,
+            cached_empty,
+        )
     pass_number = 0
     try:
         while True:
@@ -495,17 +727,29 @@ def run_merge_watch(target_path: str, recursive: bool, interval: int, output_dir
             logger.info("Starting watch scan pass #%d under %s", pass_number, target_path)
             new_count = 0
             skipped_done = 0
+            skipped_unchanged = 0
             failed_count = 0
             discovered_count = 0
 
-            for scanned_count, folder in iter_scan_roots(target_path, recursive, prune_done=True):
+            for scanned_count, folder, folder_mtime_ns in iter_scan_roots(
+                target_path, recursive, prune_done=True
+            ):
                 if is_already_done(folder):
                     skipped_done += 1
+                    update_folder_state(scan_state, folder, folder_mtime_ns, done=True)
                     logger.debug("Skipping already processed folder: %s", folder)
                     continue
 
-                dicom_files = find_mergeable_dicom_files(folder)
+                is_fresh, entry = folder_cache_is_fresh(scan_state, folder, folder_mtime_ns)
+                if is_fresh and entry is not None and entry.get("empty"):
+                    skipped_unchanged += 1
+                    continue
+
+                dicom_files = find_mergeable_dicom_files(
+                    folder, scan_state=scan_state, folder_mtime_ns=folder_mtime_ns
+                )
                 if not dicom_files:
+                    update_folder_state(scan_state, folder, folder_mtime_ns, empty=True)
                     continue
 
                 discovered_count += 1
@@ -526,6 +770,13 @@ def run_merge_watch(target_path: str, recursive: bool, interval: int, output_dir
                     )
                     print_folder_report(report, target_path)
                     mark_as_done(folder, "merge", report["results"])
+                    update_folder_state(
+                        scan_state,
+                        folder,
+                        _safe_dir_mtime_ns(folder),
+                        done=True,
+                    )
+                    save_scan_state(scan_state_path, scan_state or {})
                     new_count += 1
                 except Exception as exc:
                     failed_count += 1
@@ -535,14 +786,16 @@ def run_merge_watch(target_path: str, recursive: bool, interval: int, output_dir
             pass_elapsed = time.time() - pass_started
             logger.info(
                 "Completed watch scan pass #%d: discovered=%d new=%d skipped_done=%d "
-                "failed=%d elapsed=%.1fs",
+                "skipped_unchanged=%d failed=%d elapsed=%.1fs",
                 pass_number,
                 discovered_count,
                 new_count,
                 skipped_done,
+                skipped_unchanged,
                 failed_count,
                 pass_elapsed,
             )
+            save_scan_state(scan_state_path, scan_state or {})
 
             sleep_seconds = max(0.0, interval - pass_elapsed)
             if new_count == 0 and failed_count == 0:
@@ -711,6 +964,11 @@ def main():
                             'The directory is created automatically if it does not exist.')
     parser.add_argument('--log-file', dest='log_file', metavar='FILE',
                        help=f'Write logs to FILE (default: {default_log_path()})')
+    parser.add_argument('--scan-state-file', dest='scan_state_file', metavar='FILE',
+                       help='Persistent per-folder mtime cache used by --watch to skip '
+                            'folders whose contents have not changed since the last pass. '
+                            f'Default: {default_scan_state_path()}. '
+                            'Pass an empty string to disable the cache.')
 
     args = parser.parse_args()
 
@@ -881,11 +1139,31 @@ def main():
 
                 if args.watch_interval:
                     args.skip_if_done = True
+                    if args.scan_state_file is None:
+                        scan_state_path = default_scan_state_path()
+                    else:
+                        scan_state_path = (
+                            os.path.abspath(args.scan_state_file)
+                            if args.scan_state_file
+                            else ""
+                        )
+                    scan_state = (
+                        load_scan_state(scan_state_path, target_path)
+                        if scan_state_path
+                        else None
+                    )
+                    if scan_state_path:
+                        print(f"Scan state file: {scan_state_path}", flush=True)
+                        logger.info("Scan state file: %s", scan_state_path)
+                    else:
+                        logger.info("Scan state cache disabled")
                     exit_code = run_merge_watch(
                         target_path=target_path,
                         recursive=include_subfolders,
                         interval=args.watch_interval,
                         output_dir=out_dir,
+                        scan_state=scan_state,
+                        scan_state_path=scan_state_path,
                     )
                 else:
                     exit_code = run_merge_once(

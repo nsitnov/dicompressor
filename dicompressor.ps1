@@ -1,11 +1,10 @@
 <#
 .SYNOPSIS
-    DicomPressor - Cross-platform DICOM CLI Tool (PowerShell Wrapper)
+    DicomPressor - PowerShell Wrapper
 
 .DESCRIPTION
-    PowerShell wrapper for DicomPressor Python CLI.
+    PowerShell wrapper for the generic DicomPressor Python CLI.
     Works on Windows PowerShell and PowerShell Core.
-    Passes all arguments to the Python script.
 #>
 
 param(
@@ -25,7 +24,8 @@ foreach ($candidate in $pythonCandidates) {
             $pythonCmd = $candidate
             break
         }
-    } catch {
+    }
+    catch {
         continue
     }
 }
@@ -58,7 +58,8 @@ if (-not (Test-Path $pythonScript)) {
 
 if ($Arguments) {
     & $pythonCmd $pythonScript @Arguments
-} else {
+}
+else {
     & $pythonCmd $pythonScript
 }
 
