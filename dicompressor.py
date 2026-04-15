@@ -58,7 +58,7 @@ from dicom_utils import (
     find_dicom_files, is_dicom_file,
 )
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 PROGRAM_NAME = "DicomPressor"
 DONE_MARKER = ".dicompressor_done"
 DEFAULT_LOG_FILENAME = "dicompressor.log"
